@@ -1,0 +1,246 @@
+# VERL Configuration for 4x A100 80GB GPUs
+# Optimized for Infosys Agentic Foundry + Agent Lightning integration
+# © 2024-25 Infosys Limited, Bangalore, India. All Rights Reserved.
+
+# Algorithm configuration
+algorithm:
+  # Advantage estimator: grpo (faster) or gae (more stable)
+  adv_estimator: grpo  # Group Relative Policy Optimization
+
+  # KL divergence penalty (helps prevent policy collapse)
+  use_kl_in_reward: false
+  kl_ctrl:
+    type: fixed  # or "adaptive"
+    kl_coef: 0.001
+
+# Data configuration
+data:
+  # Batch sizes (adjust based on task complexity)
+  train_batch_size: 64  # Total across all GPUs
+  val_batch_size: 32
+
+  # Sequence lengths (adjust based on task)
+  max_prompt_length: 4096
+  max_response_length: 2048
+
+  # Data loading
+  shuffle: true
+  num_workers: 4
+
+# Model configuration
+actor_rollout_ref:
+  # Base model to fine-tune
+  model:
+    path: "Qwen/Qwen2.5-7B-Instruct"  # Recommended for 4x A100
+    # Alternative options:
+    # - "meta-llama/Llama-3.1-8B-Instruct"  # Llama 3.1
+    # - "mistralai/Mistral-7B-Instruct-v0.3"  # Mistral
+    trust_remote_code: true
+    dtype: bfloat16  # Memory efficient, supported by A100
+
+  # vLLM rollout configuration (for fast inference during training)
+  rollout:
+    name: vllm
+    gpu_memory_utilization: 0.4  # Leave 60% for training
+    tensor_parallel_size: 2  # Use 2 GPUs for vLLM
+    enforce_eager: false  # Enable CUDA graphs for speed
+    max_num_seqs: 256  # Maximum batch size for vLLM
+
+  # PPO actor training configuration
+  actor:
+    optim:
+      lr: 1e-6  # Learning rate
+      weight_decay: 0.01
+      betas: [0.9, 0.95]
+      eps: 1e-8
+
+    # PPO hyperparameters
+    ppo_mini_batch_size: 8  # Per-GPU mini-batch size
+    ppo_epochs: 2  # Number of optimization epochs per batch
+    clip_ratio_low: 0.2  # PPO clipping lower bound
+    clip_ratio_high: 0.3  # PPO clipping upper bound
+    entropy_coeff: 0.0  # Entropy regularization (0 = no entropy bonus)
+    value_loss_coeff: 1.0  # Value function loss coefficient
+
+  # Reference model (frozen baseline for KL)
+  ref:
+    log_prob_micro_batch_size: 8  # Batch size for computing log probs
+    fsdp_config:
+      param_offload: false  # Keep ref model on GPU
+      grad_offload: false
+
+# Critic configuration (value function)
+critic:
+  optim:
+    lr: 1e-5  # Higher LR than actor
+    weight_decay: 0.01
+    betas: [0.9, 0.95]
+
+  model:
+    path: "Qwen/Qwen2.5-7B-Instruct"  # Can be same or different
+    trust_remote_code: true
+    dtype: bfloat16
+
+  ppo_micro_batch_size: 8
+
+# Trainer configuration
+trainer:
+  # Training schedule
+  total_epochs: 10  # Total training epochs
+  save_freq: 1  # Save checkpoint every N epochs
+  test_freq: 1  # Run validation every N epochs
+
+  # Logging
+  project_name: "infosys-foundry-verl"
+  experiment_name: "agent-training"
+  logger: ["console", "wandb", "tensorboard"]
+
+  # Checkpoint management
+  default_hdfs_dir: "./checkpoints"
+  save_total_limit: 5  # Keep only last 5 checkpoints
+
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 3  # Stop if no improvement for 3 epochs
+    metric: "val_reward"  # Metric to monitor
+    mode: "max"  # Maximize reward
+
+# FSDP configuration for 4x A100
+trainer_fsdp:
+  use_fsdp: true
+
+  # Sharding strategy
+  # Options: FULL_SHARD, SHARD_GRAD_OP, NO_SHARD, HYBRID_SHARD
+  sharding_strategy: FULL_SHARD  # Maximum memory efficiency
+
+  # Prefetching for performance
+  backward_prefetch: BACKWARD_PRE  # Prefetch during backward pass
+  forward_prefetch: true  # Prefetch during forward pass
+
+  # Memory optimization
+  limit_all_gathers: true  # Reduce all-gather operations
+  cpu_offload: false  # Keep params on GPU (we have enough memory)
+
+  # Mixed precision
+  mixed_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    buffer_dtype: float32
+
+# Agent Lightning integration
+agentlightning:
+  # Store configuration
+  store:
+    type: mongo  # or "postgres", "memory"
+    uri: "mongodb://localhost:27017"
+    db_name: "agent_lightning_training"
+
+    # Store options
+    options:
+      max_pool_size: 100
+      min_pool_size: 10
+      timeout_ms: 5000
+
+  # Tracer configuration
+  tracer:
+    type: agentops  # or "otel", "weave"
+    auto_instrument: true
+
+    # Phoenix integration (existing Foundry telemetry)
+    phoenix:
+      enabled: true
+      project_name: "foundry-training"
+
+  # Trace aggregation (experimental feature for efficiency)
+  trace_aggregator:
+    level: trajectory  # or "turn" for per-turn training
+    trajectory_max_prompt_length: 4096
+    trajectory_max_response_length: 34384  # Increased for multi-turn
+
+    # Masking strategy for multi-turn conversations
+    mask_loss_on_prompt: true  # Only train on responses
+
+  # Rollout configuration
+  rollout:
+    timeout: 300  # Timeout per rollout (seconds)
+    max_retries: 2  # Retry failed rollouts
+    retry_delay: 5  # Delay between retries (seconds)
+
+# W&B (Weights & Biases) configuration (optional)
+wandb:
+  enabled: true
+  entity: "infosys-foundry"  # Your W&B entity
+  project: "agent-lightning"
+  tags: ["verl", "react-agent", "4xa100"]
+
+  # What to log
+  log_model: true
+  log_checkpoints: "best"  # or "all", "last"
+  log_freq: 10  # Log every N batches
+
+# Resource monitoring
+monitoring:
+  enabled: true
+
+  # GPU monitoring
+  gpu:
+    log_utilization: true
+    log_memory: true
+    log_temperature: true
+    interval: 60  # seconds
+
+  # System monitoring
+  system:
+    log_cpu: true
+    log_memory: true
+    log_disk: true
+    interval: 60
+
+# Advanced optimizations for 4x A100
+optimizations:
+  # Flash Attention 2 (requires flash-attn package)
+  use_flash_attention: true
+
+  # Gradient checkpointing (trade compute for memory)
+  gradient_checkpointing: false  # Disable (we have enough memory)
+
+  # Compile model with torch.compile (PyTorch 2.0+)
+  torch_compile:
+    enabled: true
+    backend: "inductor"  # or "aot_autograd"
+    mode: "reduce-overhead"  # or "max-autotune"
+
+  # Mixed precision training
+  use_bf16: true  # bfloat16 (better than fp16 for A100)
+  use_fp16: false
+
+  # Gradient accumulation
+  gradient_accumulation_steps: 1  # No need with large batch
+
+  # Distributed training optimizations
+  find_unused_parameters: false
+  bucket_cap_mb: 25  # Gradient bucketing size
+
+# Hardware-specific settings for 4x A100 80GB
+hardware:
+  num_gpus: 4
+  gpu_type: "A100-SXM4-80GB"
+  gpu_memory_gb: 80
+
+  # Optimal settings for A100
+  tensor_cores: true  # Use Tensor Cores
+  cuda_version: "12.1"  # Or your installed version
+  nccl_backend: true  # For multi-GPU communication
+
+  # Memory allocation strategy
+  pytorch_cuda_alloc_conf: "max_split_size_mb:512"
+
+# Training tips and recommendations
+# 1. Start with smaller model (7B) to validate pipeline
+# 2. Monitor GPU utilization - should be >80%
+# 3. Adjust batch size if OOM (out of memory)
+# 4. Use trajectory aggregation for multi-turn tasks
+# 5. Enable W&B for visualization
+# 6. Regular checkpointing (every epoch)
+# 7. A/B test before production deployment
